@@ -1,0 +1,109 @@
+Close
+i
+13 Dec 26
+Reveal
+i
+14 Dec 26
+About
+This challenge provides approximately 370 hours of Fongbe speech data, including recordings from multiple speakers, domains and recording conditions. The dataset includes both high-quality, linguist-validated transcriptions and recordings with less reliable tone annotations, giving participants an opportunity to explore how best to learn from data of varying quality.
+
+All audio is provided as mono, 16 kHz, 16-bit WAV files, and speakers are identified using anonymous codes. The data is provided as is, without additional annotation.
+
+The training data is divided into three datasets:
+
+Train_reliable.csv - Approximately 106 hours of speech with tone-marked transcriptions reviewed and validated by linguists. The recommended_validation column identifies speakers reserved for local validation, allowing you to evaluate your model on voices it has not encountered during training.
+Train_uncertain.csv - Approximately 198 hours of speech with transcriptions whose tonal accuracy is uncertain. These recordings provide an opportunity to experiment with data filtering, weighting and other techniques for learning from imperfect annotations. The protocol column identifies the recording protocol (p1, p2 or p3).
+Train_religious.csv - Approximately 42 hours of Bible readings by a single speaker, with tone-marked transcriptions. This dataset introduces a different speech domain and can be used to explore how models generalise across speaking styles and content.
+Training files contain id, audio_path, transcription, speaker_id and duration (in seconds), along with relevant metadata such as recommended_validation, protocol, book and chapter where available.
+
+Test.csv contains 9,407 audio recordings (approximately 22 hours) without transcriptions. It includes two distinct evaluation sets:
+
+General speech: 6,382 recordings from 60 speakers who do not appear in the training data.
+Religious speech: 3,025 recordings from the same reader as Train_religious.csv, covering entire Bible books excluded from training.
+Both sets are divided between the public and private leaderboards, using different speakers and Bible books for each split. This tests how well your model generalises to unseen voices and content.
+
+SampleSubmission.csv provides the required submission format, containing two columns:
+
+ID - The unique identifier for each test recording.
+Target - Your predicted Fongbe transcription, processed using the provided syllabify.py script.
+Important: All predicted transcriptions must be processed using syllabify.py before submission. The evaluation metric calculates Weighted Word Error Rate on syllabified text, allowing tone errors to be measured more fairly. Lower scores are better.
+
+The dataset also includes the following resources to help you get started:
+
+audio_*.tar - Audio archives containing the WAV recordings, with SHA256SUMS for verifying downloads. You can find a link to these on the Chat.
+conventions.md - Transcription conventions, normalisation rules, scoring details and permitted resources.
+syllabify.py - Mandatory preprocessing script for converting transcriptions into the evaluation format.
+normalize.py and score.py - Tools for text normalisation, local evaluation and detailed tone-error diagnostics.
+test_score.py - Tests to verify that the scoring implementation works correctly.
+measure_frugality.py - Tool for checking model size, CPU inference speed, memory usage and offline operation.
+starter_notebook.ipynb - A step-by-step baseline using w2v-BERT 2.0, covering data preparation, model fine-tuning, evaluation and submission generation. It runs on a free Kaggle T4 GPU and provides a starting point for developing your own solution. The baseline does not meet the inference-efficiency requirements as provided.
+Transcription Conventions
+Fongbe transcriptions follow the project's writing conventions. Tone marks are essential, and participants should preserve the correct spelling and tone of each word.
+
+Acute accent (´) represents high tone.
+Grave accent (`) represents low tone.
+Caron (ˇ) represents rising tone.
+Fongbe-specific characters, including ɖ, ɛ and ɔ, must be preserved.
+French and English loanwords retain their original spelling without tone marks.
+Refer to conventions.md for the complete transcription rules.
+
+Files
+Description
+Files
+Provides the required submission format, containing two columns: ID - The unique identifier for each test recording. Target - Your predicted Fongbe transcription, processed using the provided syllabify.py script.
+
+SampleSubmission.csv
+128.6 KB
+Test resembles Train.csv but without the target-related columns. This is the dataset to which you will apply your model.
+
+Test.csv
+367.5 KB
+README
+
+README.md
+6.5 KB
+Approximately 106 hours of speech with tone-marked transcriptions reviewed and validated by linguists. The recommended_validation column identifies speakers reserved for local validation, allowing you to evaluate your model on voices it has not encountered during training.
+
+Train_reliable.csv
+7.9 MB
+Approximately 198 hours of speech with transcriptions whose tonal accuracy is uncertain. These recordings provide an opportunity to experiment with data filtering, weighting and other techniques for learning from imperfect annotations. The protocol column identifies the recording protocol (p1, p2 or p3).
+
+Train_uncertain.csv
+12.1 MB
+Approximately 42 hours of Bible readings by a single speaker, with tone-marked transcriptions. This dataset introduces a different speech domain and can be used to explore how models generalise across speaking styles and content.
+
+Train_religious.csv
+2.5 MB
+Transcription conventions, normalisation rules, scoring details and permitted resources.
+
+conventions.md
+4.2 KB
+Mandatory preprocessing script for converting transcriptions into the evaluation format.
+
+syllabify.py
+5.4 KB
+Tools for text normalisation, local evaluation and detailed tone-error diagnostics.
+
+normalize.py
+5.8 KB
+Tools for text normalisation, local evaluation and detailed tone-error diagnostics.
+
+score.py
+6.1 KB
+Tests to verify that the scoring implementation works correctly.
+
+test_score.py
+5.2 KB
+Tool for checking model size, CPU inference speed, memory usage and offline operation.
+
+measure_frugality.py
+9.7 KB
+A step-by-step baseline using w2v-BERT 2.0, covering data preparation, model fine-tuning, evaluation and submission generation. It runs on a free Kaggle T4 GPU and provides a starting point for developing your own solution. The baseline does not meet the inference-efficiency requirements as provided.
+
+starter_notebook.ipynb
+24.5 KB
+
+
+
+
+https://storage.googleapis.com/fongbe/

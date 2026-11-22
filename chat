@@ -1,0 +1,15 @@
+Hi everyone,
+
+The audio dataset files are now available for download from our public Google Cloud Storage bucket:
+
+https://storage.googleapis.com/fongbe/
+
+The link displays an XML listing of all available files, including the test audio and training audio archives (reliable, religious and uncertain).
+
+You can download all files using Python and the Google Cloud Storage library.
+
+Alternatively, you can download individual files directly using their URLs.
+
+Please note: Some archives are around 2 GB each, so ensure you have sufficient space and a stable internet connection before downloading.
+
+
