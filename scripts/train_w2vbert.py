@@ -51,6 +51,9 @@ def parse_args():
                    help="Dossier de travail LOCAL (checkpoints + modèle final)")
     p.add_argument("--sync-dir", default=None,
                    help="Dossier distant PARTAGÉ (Drive) : checkpoints + artefacts y sont copiés")
+    p.add_argument("--hf-repo", default=None,
+                   help="Repo Hugging Face (ex: user/fongbe-ckpt) : 2e destination de sync, "
+                        "token via variable d'env HF_TOKEN")
     p.add_argument("--base-model", default="facebook/w2v-bert-2.0")
     p.add_argument("--max-steps", type=int, default=4000)
     p.add_argument("--batch-size", type=int, default=4)
@@ -171,6 +174,7 @@ class Syncer:
                     print(f"⚠️  sync {rel} échoué ({e}), retry {attempt+1}/3", flush=True)
                 time.sleep(5)
             if ok:
+                self.failed = False
                 print(f"☁️  sync → {rel}", flush=True)
             else:
                 print(f"❌ sync {rel} PERDU après 3 essais", flush=True)
@@ -179,6 +183,85 @@ class Syncer:
 
     def wait(self, timeout=600):
         self._q.join()
+
+
+class HfSyncer:
+    """Upload séquentiel vers un repo Hugging Face — alternative robuste à Drive.
+
+    Même file unique que Syncer : les gros checkpoints ne se marchent pas dessus.
+    Token via la variable d'environnement HF_TOKEN (huggingface_hub la lit seule).
+    """
+
+    def __init__(self, repo_id: str):
+        import queue
+        from huggingface_hub import HfApi
+        self.repo_id = repo_id
+        self.api = HfApi()
+        self._q = queue.Queue()
+        self._pending = set()
+        self.failed = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def submit(self, src: Path, rel: str):
+        self._pending.add(str(src))
+        self._q.put((src, rel))
+
+    def is_pending(self, path: Path) -> bool:
+        return str(path) in self._pending
+
+    def _remote_size(self, rel: str):
+        from huggingface_hub import get_hf_file_metadata
+        url = f"https://huggingface.co/{self.repo_id}/resolve/main/{rel}"
+        return get_hf_file_metadata(url).size
+
+    def _run(self):
+        while True:
+            src, rel = self._q.get()
+            self._pending.discard(str(src))
+            ok = False
+            for attempt in range(3):
+                try:
+                    self.api.upload_file(path_or_fileobj=str(src),
+                                         path_in_repo=rel, repo_id=self.repo_id)
+                    if self._remote_size(rel) == src.stat().st_size:
+                        ok = True
+                        break
+                    print(f"⚠️  hf sync {rel} : taille mismatch, retry {attempt+1}/3", flush=True)
+                except Exception as e:
+                    print(f"⚠️  hf sync {rel} échoué ({e}), retry {attempt+1}/3", flush=True)
+                time.sleep(5)
+            if ok:
+                self.failed = False
+                print(f"🤗 sync → {self.repo_id}/{rel}", flush=True)
+            else:
+                print(f"❌ hf sync {rel} PERDU après 3 essais", flush=True)
+                if rel.endswith(".pt"):
+                    self.failed = True
+
+    def wait(self, timeout=600):
+        self._q.join()
+
+
+def latest_hf_checkpoint(repo_id: str, dest_dir: Path):
+    """Télécharge le plus gros step_*.pt du repo HF dans dest_dir. Retourne le path local."""
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+        api = HfApi()
+        best_step, best_path = -1, None
+        for f in api.list_repo_tree(repo_id, repo_type="model", recursive=True):
+            p = getattr(f, "path", "") or ""
+            if "/step_" in p and p.endswith(".pt") and _step_of(Path(p)) > best_step:
+                best_step, best_path = _step_of(Path(p)), p
+        if best_path is None:
+            return None
+        local = hf_hub_download(repo_id, best_path, repo_type="model",
+                                local_dir=str(dest_dir))
+        print(f"⬇️  checkpoint HF {best_path} (step {best_step}) rapatrié", flush=True)
+        return Path(local)
+    except Exception as e:
+        print(f"⚠️  lookup HF échoué ({type(e).__name__}: {e})", flush=True)
+        return None
 
 
 def main():
@@ -190,11 +273,21 @@ def main():
     data_dir = Path(args.data_dir)
     work_dir = Path(args.work_dir)
     local_ckpt = work_dir / "checkpoints"
-    sync_dir = Path(args.sync_dir) if args.sync_dir else None
-    sync_ckpt = sync_dir / "checkpoints" if sync_dir else None
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    syncer = Syncer(sync_dir) if sync_dir else None
+    # ---------- Syncers (Drive +/ou Hugging Face) ----------
+    syncers = []
+    sync_dir = Path(args.sync_dir) if args.sync_dir else None
+    sync_ckpt = sync_dir / "checkpoints" if sync_dir else None
+    if sync_dir:
+        syncers.append(Syncer(sync_dir))
+    if args.hf_repo:
+        try:
+            syncers.append(HfSyncer(args.hf_repo))
+            print(f"sync HF → {args.hf_repo}", flush=True)
+        except Exception as e:
+            print(f"⚠️  HF sync indisponible ({e}) — Drive seul", flush=True)
+    syncer = syncers[0] if syncers else None  # compat affichage
 
     if sync_dir:
         # Le vrai dossier partagé contient data/ et audio/ à côté d'outputs/
@@ -296,6 +389,10 @@ def main():
     step, start_time = 0, time.time()
     if not args.no_resume:
         ckpt = latest_checkpoint(local_ckpt, sync_ckpt)
+        if args.hf_repo:
+            hf_ckpt = latest_hf_checkpoint(args.hf_repo, work_dir)
+            if hf_ckpt and (ckpt is None or _step_of(hf_ckpt) > _step_of(ckpt)):
+                ckpt = hf_ckpt
         if ckpt is not None:
             if ckpt.parent == sync_ckpt:
                 # checkpoint distant → rapatriement local avant chargement
@@ -330,7 +427,11 @@ def main():
           f"sync Drive: {'oui' if syncer else 'non'}) ===", flush=True)
     model.train()
     micro, running = 0, []
-    while step < args.max_steps and not (syncer and syncer.failed):
+    all_failed = lambda: bool(syncers) and all(s.failed for s in syncers)
+    any_pending = lambda p: any(s.is_pending(p) for s in syncers)
+    total_q = lambda: sum(s._q.qsize() for s in syncers)
+
+    while step < args.max_steps and not all_failed():
         loader = DataLoader(train_set,
                             batch_sampler=length_batches(train_df.duration.values,
                                                          args.batch_size, True),
@@ -352,8 +453,8 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             step += 1
-            if syncer and syncer.failed:
-                print("⛔ sync Drive en échec — arrêt propre du training "
+            if all_failed():
+                print("⛔ sync en échec sur TOUTES les destinations — arrêt propre "
                       "(checkpoints locaux conservés, relançable)", flush=True)
                 break
             if step % 100 == 0:
@@ -371,19 +472,18 @@ def main():
                                      "torch": torch.get_rng_state(),
                                      "cuda": torch.cuda.get_rng_state() if device == "cuda" else None})
                     prune_checkpoints(local_ckpt, args.keep_checkpoints,
-                                      protect=syncer.is_pending if syncer else None)
+                                      protect=any_pending if syncers else None)
                     if sync_ckpt:
                         try:
                             prune_checkpoints(sync_ckpt, args.keep_checkpoints)
                         except Exception:
                             pass
-                    if syncer:
-                        syncer.submit(local_ckpt / f"step_{step}.pt",
-                                      f"checkpoints/step_{step}.pt")
-                        syncer.submit(work_dir / "vocab.json", "vocab.json")
-                    qsize = syncer._q.qsize() if syncer else 0
+                    for s in syncers:
+                        s.submit(local_ckpt / f"step_{step}.pt",
+                                 f"checkpoints/step_{step}.pt")
+                        s.submit(work_dir / "vocab.json", "vocab.json")
                     print(f"💾 checkpoint step_{step} écrit en local"
-                          + (f" — sync Drive en cours (file: {qsize})" if syncer else ""), flush=True)
+                          + (f" — sync en cours (file: {total_q()})" if syncers else ""), flush=True)
                 except Exception as e:
                     print(f"⚠️ checkpoint step_{step} échoué ({e}) — training continue", flush=True)
             if step >= args.max_steps:
@@ -435,23 +535,26 @@ def main():
     print(f"✅ terminé en {(time.time()-start_time)/60:.0f} min — modèle dans {model_dir}",
           flush=True)
 
-    if syncer:
-        # Copie des artefacts finaux vers le dossier partagé
+    if syncers:
+        # Copie des artefacts finaux vers les destinations de sync
         for name in ["valid_reference.csv", "valid_prediction.csv", "score_output.txt"]:
             f = work_dir / name
             if f.exists():
-                syncer.submit(f, name)
+                for s in syncers:
+                    s.submit(f, name)
         # Le dossier model/ peut être volumineux : on le copie fichier par fichier
         for f in model_dir.iterdir():
             if f.is_file():
-                syncer.submit(f, f"model/{f.name}")
-        syncer.wait(timeout=1800)
+                for s in syncers:
+                    s.submit(f, f"model/{f.name}")
+        for s in syncers:
+            s.wait(timeout=1800)
         if sync_ckpt:
             try:
                 prune_checkpoints(sync_ckpt, args.keep_checkpoints)
             except Exception:
                 pass
-        print(f"☁️  artefacts synchronisés vers {sync_dir}", flush=True)
+        print(f"☁️  artefacts synchronisés ({len(syncers)} destination(s))", flush=True)
 
 
 if __name__ == "__main__":
