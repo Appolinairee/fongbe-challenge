@@ -3,21 +3,28 @@
 
 Usage :
     python train_w2vbert.py --data-dir /content/fongbe \
-        --output-dir /content/drive/MyDrive/fongbe-challenge/outputs/run1 \
+        --work-dir /content/fongbe_run \
+        --sync-dir /content/drive/MyDrive/fongbe-challenge/outputs/w2vbert_shared \
         --checkpoint-every 500
 
-Reprend automatiquement le dernier checkpoint trouvé dans
-<output-dir>/checkpoints/ s'il existe (même step incomplet), sinon repart de zéro.
-Les checkpoints sont écrits dans un fichier temporaire puis renommés (atomique).
+Architecture robuste :
+- Les checkpoints sont écrits sur le **disque local** (--work-dir/checkpoints/),
+  jamais directement sur Drive : pas de blocage FUSE pendant le training.
+- Chaque checkpoint est ensuite **copié en arrière-plan** vers --sync-dir
+  (Drive partagé) : un autre compte peut reprendre là où ce run s'est arrêté.
+- À la reprise, on prend le plus grand step parmi les checkpoints locaux ET
+  ceux du sync-dir (téléchargés en local si nécessaire).
+- Toutes les écritures de checkpoints sont atomiques (tmp + os.replace).
 """
 
 import argparse
 import json
-import math
 import os
 import random
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -37,7 +44,10 @@ from transformers import (
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", required=True, help="Dossier contenant CSV + audio/")
-    p.add_argument("--output-dir", required=True, help="Dossier de sortie (checkpoints inclus)")
+    p.add_argument("--work-dir", required=True,
+                   help="Dossier de travail LOCAL (checkpoints + modèle final)")
+    p.add_argument("--sync-dir", default=None,
+                   help="Dossier distant PARTAGÉ (Drive) : checkpoints + artefacts y sont copiés")
     p.add_argument("--base-model", default="facebook/w2v-bert-2.0")
     p.add_argument("--max-steps", type=int, default=4000)
     p.add_argument("--batch-size", type=int, default=4)
@@ -47,19 +57,36 @@ def parse_args():
     p.add_argument("--max-seconds", type=float, default=15.0)
     p.add_argument("--n-validation", type=int, default=300)
     p.add_argument("--checkpoint-every", type=int, default=500)
-    p.add_argument("--keep-checkpoints", type=int, default=3, help="Nb de checkpoints conservés")
+    p.add_argument("--keep-checkpoints", type=int, default=3)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--no-resume", action="store_true")
     return p.parse_args()
 
 
-def latest_checkpoint(ckpt_dir: Path):
-    """Retourne le checkpoint au plus grand step, ou None."""
-    if not ckpt_dir.exists():
-        return None
-    cands = sorted(ckpt_dir.glob("step_*.pt"),
-                   key=lambda p: int(p.stem.split("_")[1]) if p.stem.split("_")[1].isdigit() else -1)
-    return cands[-1] if cands else None
+def _step_of(path: Path) -> int:
+    try:
+        return int(path.stem.split("_")[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def latest_checkpoint(*dirs: Path):
+    """Retourne (step, path) du plus grand checkpoint parmi les dossiers donnés."""
+    best = (-1, None)
+    for d in dirs:
+        if d and d.exists():
+            for p in d.glob("step_*.pt"):
+                if _step_of(p) > best[0]:
+                    best = (_step_of(p), p)
+    return best[1]
+
+
+def atomic_copy(src: Path, dst: Path):
+    """Copie atomique : dst_tmp puis rename (évite les fichiers partiels visibles)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
 
 
 def save_checkpoint(path: Path, step, model, optimizer, scheduler, scaler, rng_states):
@@ -73,14 +100,39 @@ def save_checkpoint(path: Path, step, model, optimizer, scheduler, scaler, rng_s
         "scaler": scaler.state_dict(),
         "rng": rng_states,
     }, tmp)
-    os.replace(tmp, path)  # atomique : jamais de checkpoint partiel visible
+    os.replace(tmp, path)
 
 
 def prune_checkpoints(ckpt_dir: Path, keep: int):
-    cands = sorted(ckpt_dir.glob("step_*.pt"),
-                   key=lambda p: int(p.stem.split("_")[1]) if p.stem.split("_")[1].isdigit() else -1)
+    cands = sorted(ckpt_dir.glob("step_*.pt"), key=_step_of)
     for old in cands[:-keep] if keep > 0 else []:
         old.unlink(missing_ok=True)
+
+
+class Syncer:
+    """Copie en arrière-plan des checkpoints/artefacts vers le dossier partagé."""
+
+    def __init__(self, sync_dir: Path):
+        self.sync_dir = sync_dir
+        self._threads = []
+
+    def submit(self, src: Path, rel: str):
+        dst = self.sync_dir / rel
+
+        def work():
+            try:
+                atomic_copy(src, dst)
+                print(f"☁️  sync → {rel}", flush=True)
+            except Exception as e:
+                print(f"⚠️  sync {rel} échoué ({e})", flush=True)
+
+        t = threading.Thread(target=work, daemon=True)
+        self._threads.append(t)
+        t.start()
+
+    def wait(self, timeout=600):
+        for t in self._threads:
+            t.join(timeout=max(1, timeout // max(1, len(self._threads))))
 
 
 def main():
@@ -90,9 +142,13 @@ def main():
     torch.manual_seed(args.seed)
 
     data_dir = Path(args.data_dir)
-    out_dir = Path(args.output_dir)
-    ckpt_dir = out_dir / "checkpoints"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(args.work_dir)
+    local_ckpt = work_dir / "checkpoints"
+    sync_dir = Path(args.sync_dir) if args.sync_dir else None
+    sync_ckpt = sync_dir / "checkpoints" if sync_dir else None
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    syncer = Syncer(sync_dir) if sync_dir else None
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device} {torch.cuda.get_device_name(0) if device == 'cuda' else ''}", flush=True)
@@ -114,13 +170,13 @@ def main():
           f"{train_df.speaker_id.nunique()} voices", flush=True)
     print(f"valid: {len(valid_df):,} utts, {valid_df.speaker_id.nunique()} voices (unseen)", flush=True)
 
-    # ---------- Tokenizer (reconstruit de façon déterministe) ----------
+    # ---------- Tokenizer (déterministe) ----------
     chars = sorted(set("".join(train_df.target)) - {" "})
     vocab = {c: i for i, c in enumerate(chars)}
     vocab["|"] = len(vocab)
     vocab["[UNK]"] = len(vocab)
     vocab["[PAD]"] = len(vocab)
-    vocab_path = out_dir / "vocab.json"
+    vocab_path = work_dir / "vocab.json"
     if not vocab_path.exists():
         vocab_path.write_text(json.dumps(vocab, ensure_ascii=False))
     tokenizer = Wav2Vec2CTCTokenizer(str(vocab_path), unk_token="[UNK]", pad_token="[PAD]",
@@ -181,11 +237,17 @@ def main():
     scheduler = get_linear_schedule_with_warmup(optimizer, args.warmup_steps, args.max_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda")
 
-    # ---------- Reprise ----------
+    # ---------- Reprise (local d'abord, puis sync distant) ----------
     step, start_time = 0, time.time()
     if not args.no_resume:
-        ckpt = latest_checkpoint(ckpt_dir)
+        ckpt = latest_checkpoint(local_ckpt, sync_ckpt)
         if ckpt is not None:
+            if ckpt.parent == sync_ckpt:
+                # checkpoint distant → rapatriement local avant chargement
+                print(f"⬇️  rapatriement {ckpt.name} depuis le sync-dir...", flush=True)
+                local_ckpt.mkdir(parents=True, exist_ok=True)
+                atomic_copy(ckpt, local_ckpt / ckpt.name)
+                ckpt = local_ckpt / ckpt.name
             state = torch.load(ckpt, map_location=device, weights_only=False)
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
@@ -194,7 +256,7 @@ def main():
             random.setstate(state["rng"]["python"])
             np.random.set_state(state["rng"]["numpy"])
             torch.set_rng_state(state["rng"]["torch"])
-            if device == "cuda":
+            if device == "cuda" and state["rng"].get("cuda") is not None:
                 torch.cuda.set_rng_state(state["rng"]["cuda"])
             step = state["step"]
             print(f"↻ reprise depuis {ckpt.name} (step {step})", flush=True)
@@ -230,14 +292,19 @@ def main():
                 running = []
             if step % args.checkpoint_every == 0:
                 try:
-                    save_checkpoint(ckpt_dir / f"step_{step}.pt", step, model, optimizer,
+                    save_checkpoint(local_ckpt / f"step_{step}.pt", step, model, optimizer,
                                     scheduler, scaler,
                                     {"python": random.getstate(), "numpy": np.random.get_state(),
                                      "torch": torch.get_rng_state(),
                                      "cuda": torch.cuda.get_rng_state() if device == "cuda" else None})
-                    prune_checkpoints(ckpt_dir, args.keep_checkpoints)
-                    print(f"💾 checkpoint step_{step}", flush=True)
-                except Exception as e:  # Drive peut ramer/couper : on continue le training
+                    prune_checkpoints(local_ckpt, args.keep_checkpoints)
+                    if syncer:
+                        syncer.submit(local_ckpt / f"step_{step}.pt",
+                                      f"checkpoints/step_{step}.pt")
+                        syncer.submit(work_dir / "vocab.json", "vocab.json")
+                    print(f"💾 checkpoint step_{step} (local" +
+                          (" + sync Drive" if syncer else "") + ")", flush=True)
+                except Exception as e:
                     print(f"⚠️ checkpoint step_{step} échoué ({e}) — training continue", flush=True)
             if step >= args.max_steps:
                 break
@@ -263,28 +330,46 @@ def main():
 
     valid_df = valid_df.copy()
     valid_df["prediction"] = transcribe(valid_df)
-    valid_df[["id", "transcription"]].to_csv(out_dir / "valid_reference.csv", index=False)
+    valid_df[["id", "transcription"]].to_csv(work_dir / "valid_reference.csv", index=False)
     valid_df[["id", "prediction"]].rename(
-        columns={"prediction": "transcription"}).to_csv(out_dir / "valid_prediction.csv",
+        columns={"prediction": "transcription"}).to_csv(work_dir / "valid_prediction.csv",
                                                       index=False)
 
     score_proc = subprocess.run(
         [sys.executable, str(data_dir / "score.py"),
-         "--reference", str(out_dir / "valid_reference.csv"),
-         "--submission", str(out_dir / "valid_prediction.csv")],
+         "--reference", str(work_dir / "valid_reference.csv"),
+         "--submission", str(work_dir / "valid_prediction.csv")],
         capture_output=True, text=True)
     print(score_proc.stdout, flush=True)
-    (out_dir / "score_output.txt").write_text(score_proc.stdout + score_proc.stderr)
+    (work_dir / "score_output.txt").write_text(score_proc.stdout + score_proc.stderr)
 
     for _, r in valid_df.head(5).iterrows():
         print("REF:", r.transcription, "\nHYP:", r.prediction, "\n")
 
     # ---------- Sauvegarde finale ----------
-    model_dir = out_dir / "model"
+    model_dir = work_dir / "model"
     model.save_pretrained(model_dir)
     processor.save_pretrained(model_dir)
     print(f"✅ terminé en {(time.time()-start_time)/60:.0f} min — modèle dans {model_dir}",
           flush=True)
+
+    if syncer:
+        # Copie des artefacts finaux vers le dossier partagé
+        for name in ["valid_reference.csv", "valid_prediction.csv", "score_output.txt"]:
+            f = work_dir / name
+            if f.exists():
+                syncer.submit(f, name)
+        # Le dossier model/ peut être volumineux : on le copie fichier par fichier
+        for f in model_dir.iterdir():
+            if f.is_file():
+                syncer.submit(f, f"model/{f.name}")
+        syncer.wait(timeout=1800)
+        if sync_ckpt:
+            try:
+                prune_checkpoints(sync_ckpt, args.keep_checkpoints)
+            except Exception:
+                pass
+        print(f"☁️  artefacts synchronisés vers {sync_dir}", flush=True)
 
 
 if __name__ == "__main__":
