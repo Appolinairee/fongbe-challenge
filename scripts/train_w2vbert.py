@@ -486,7 +486,13 @@ def main():
     print(f"{n_params:.0f} M parameters", flush=True)
 
     train_set = SpeechSet(train_df)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
+    try:
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
+        print("optimiseur: AdamW8bit (bitsandbytes, ~4 GB GPU libérés)", flush=True)
+    except Exception as e:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
+        print(f"optimiseur: AdamW fp32 (bitsandbytes indisponible: {e})", flush=True)
     scheduler = get_linear_schedule_with_warmup(optimizer, args.warmup_steps, args.max_steps)
     scaler = torch.cuda.amp.GradScaler(enabled=device == "cuda")
 
@@ -511,7 +517,10 @@ def main():
                 ckpt = local_ckpt / ckpt.name
             state = torch.load(ckpt, map_location=device, weights_only=False)
             model.load_state_dict(state["model"])
-            optimizer.load_state_dict(state["optimizer"])
+            try:
+                optimizer.load_state_dict(state["optimizer"])
+            except Exception as e:
+                print(f"⚠️ état optimiseur non restauré ({e}) — optimiseur frais", flush=True)
             scheduler.load_state_dict(state["scheduler"])
             scaler.load_state_dict(state["scaler"])
             try:
