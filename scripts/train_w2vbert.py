@@ -253,11 +253,19 @@ def main():
             optimizer.load_state_dict(state["optimizer"])
             scheduler.load_state_dict(state["scheduler"])
             scaler.load_state_dict(state["scaler"])
-            random.setstate(state["rng"]["python"])
-            np.random.set_state(state["rng"]["numpy"])
-            torch.set_rng_state(state["rng"]["torch"])
-            if device == "cuda" and state["rng"].get("cuda") is not None:
-                torch.cuda.set_rng_state(state["rng"]["cuda"])
+            try:
+                random.setstate(state["rng"]["python"])
+                np.random.set_state(state["rng"]["numpy"])
+                t = state["rng"]["torch"]
+                if not torch.is_tensor(t):
+                    t = torch.tensor(t, dtype=torch.uint8)
+                torch.set_rng_state(t)
+                if device == "cuda" and state["rng"].get("cuda") is not None:
+                    c = state["rng"]["cuda"]
+                    torch.cuda.set_rng_state(c if torch.is_tensor(c)
+                                             else torch.tensor(c, dtype=torch.uint8))
+            except Exception as e:
+                print(f"⚠️ état RNG non restauré ({e}) — reprise continue", flush=True)
             step = state["step"]
             print(f"↻ reprise depuis {ckpt.name} (step {step})", flush=True)
 
