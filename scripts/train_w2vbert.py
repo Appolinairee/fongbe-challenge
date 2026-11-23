@@ -118,6 +118,7 @@ class Syncer:
     def __init__(self, sync_dir: Path):
         self.sync_dir = sync_dir
         self._threads = []
+        self.failed = False  # True si un artefact critique (.pt) n'a pas pu être synchronisé
 
     def submit(self, src: Path, rel: str):
         dst = self.sync_dir / rel
@@ -143,7 +144,12 @@ class Syncer:
                 except Exception as e:
                     print(f"⚠️  sync {rel} échoué ({e}), retry {attempt+1}/3", flush=True)
                 time.sleep(5)
-            print(f"☁️  sync → {rel}" if ok else f"❌ sync {rel} PERDU après 3 essais", flush=True)
+            if ok:
+                print(f"☁️  sync → {rel}", flush=True)
+            else:
+                print(f"❌ sync {rel} PERDU après 3 essais", flush=True)
+                if rel.endswith(".pt"):
+                    self.failed = True
 
         t = threading.Thread(target=work, daemon=True)
         self._threads.append(t)
@@ -303,7 +309,7 @@ def main():
           f"sync Drive: {'oui' if syncer else 'non'}) ===", flush=True)
     model.train()
     micro, running = 0, []
-    while step < args.max_steps:
+    while step < args.max_steps and not (syncer and syncer.failed):
         loader = DataLoader(train_set,
                             batch_sampler=length_batches(train_df.duration.values,
                                                          args.batch_size, True),
@@ -325,6 +331,10 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             step += 1
+            if syncer and syncer.failed:
+                print("⛔ sync Drive en échec — arrêt propre du training "
+                      "(checkpoints locaux conservés, relançable)", flush=True)
+                break
             if step % 100 == 0:
                 elapsed = time.time() - start_time
                 sec_per_step = elapsed / max(step, 1)
