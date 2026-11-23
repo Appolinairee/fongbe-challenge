@@ -20,6 +20,9 @@ Architecture robuste :
 import argparse
 import json
 import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import random
 import shutil
 import subprocess
@@ -120,11 +123,27 @@ class Syncer:
         dst = self.sync_dir / rel
 
         def work():
-            try:
-                atomic_copy(src, dst)
-                print(f"☁️  sync → {rel}", flush=True)
-            except Exception as e:
-                print(f"⚠️  sync {rel} échoué ({e})", flush=True)
+            ok = False
+            for attempt in range(3):
+                try:
+                    atomic_copy(src, dst)
+                    # fsync best-effort : force le flush des données vers Drive
+                    try:
+                        fd = os.open(dst, os.O_RDONLY)
+                        os.fsync(fd)
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    # Vérifie que le fichier distant a la bonne taille
+                    # (le mount FUSE peut buffériser : copy2 peut retourner avant flush)
+                    if dst.exists() and dst.stat().st_size == src.stat().st_size:
+                        ok = True
+                        break
+                    print(f"⚠️  sync {rel} : taille mismatch, retry {attempt+1}/3", flush=True)
+                except Exception as e:
+                    print(f"⚠️  sync {rel} échoué ({e}), retry {attempt+1}/3", flush=True)
+                time.sleep(5)
+            print(f"☁️  sync → {rel}" if ok else f"❌ sync {rel} PERDU après 3 essais", flush=True)
 
         t = threading.Thread(target=work, daemon=True)
         self._threads.append(t)
@@ -149,6 +168,15 @@ def main():
     work_dir.mkdir(parents=True, exist_ok=True)
 
     syncer = Syncer(sync_dir) if sync_dir else None
+
+    if sync_dir:
+        # Le vrai dossier partagé contient data/ et audio/ à côté d'outputs/
+        shared_root = sync_dir.parent.parent
+        markers = [p.name for p in shared_root.iterdir()] if shared_root.exists() else []
+        if "data" not in markers:
+            print(f"⚠️  ATTENTION : {shared_root} ne ressemble pas au dossier partagé "
+                  f"(contenu: {markers}). Checkpoints possiblement perdus — "
+                  f"vérifier que le compte Colab a bien le raccourci Drive.", flush=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device} {torch.cuda.get_device_name(0) if device == 'cuda' else ''}", flush=True)
