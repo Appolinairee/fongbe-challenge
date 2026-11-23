@@ -54,6 +54,9 @@ def parse_args():
     p.add_argument("--hf-repo", default=None,
                    help="Repo Hugging Face (ex: user/fongbe-ckpt) : 2e destination de sync, "
                         "token via variable d'env HF_TOKEN")
+    p.add_argument("--sync-remote", default=None,
+                   help="Remote rclone (ex: fonvoice-drive:dossier) : checkpoints écrits "
+                        "PAR le compte propriétaire → quota propriétaire, pas de FUSE")
     p.add_argument("--base-model", default="facebook/w2v-bert-2.0")
     p.add_argument("--max-steps", type=int, default=4000)
     p.add_argument("--batch-size", type=int, default=4)
@@ -243,6 +246,101 @@ class HfSyncer:
         self._q.join()
 
 
+def _rclone(*args, check=True):
+    return subprocess.run(["rclone", *args], capture_output=True, text=True, check=check)
+
+
+class RcloneSyncer:
+    """Sync séquentielle via rclone vers un remote du COMPTE PROPRIÉTAIRE.
+
+    - Les fichiers sont possédés par le compte du remote → quota du propriétaire.
+    - Upload HTTP résumable : pas de perte liée au cache FUSE.
+    - rclone doit être installé et configuré (RCLONE_CONFIG_* ou rclone.conf).
+    """
+
+    def __init__(self, remote: str):
+        import queue
+        self.remote = remote.rstrip("/")
+        self._q = queue.Queue()
+        self._pending = set()
+        self.failed = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def submit(self, src: Path, rel: str):
+        self._pending.add(str(src))
+        self._q.put((src, rel))
+
+    def is_pending(self, path: Path) -> bool:
+        return str(path) in self._pending
+
+    def _remote_size(self, rel: str):
+        r = _rclone("lsjson", f"{self.remote}/{rel}", check=False)
+        if r.returncode != 0 or not r.stdout.strip():
+            return -1
+        try:
+            return int(json.loads(r.stdout)[0]["Size"])
+        except Exception:
+            return -1
+
+    def _run(self):
+        while True:
+            src, rel = self._q.get()
+            self._pending.discard(str(src))
+            dst = f"{self.remote}/{rel}"
+            ok = False
+            for attempt in range(3):
+                try:
+                    r = _rclone("copyto", str(src), dst, "--stats-one-line", "--retries", "3",
+                                check=False)
+                    if r.returncode == 0 and self._remote_size(rel) == src.stat().st_size:
+                        ok = True
+                        break
+                    print(f"⚠️  rclone sync {rel} : rc={r.returncode} ou taille mismatch, "
+                          f"retry {attempt+1}/3", flush=True)
+                except Exception as e:
+                    print(f"⚠️  rclone sync {rel} échoué ({e}), retry {attempt+1}/3", flush=True)
+                time.sleep(5)
+            if ok:
+                self.failed = False
+                print(f"🪣 sync → {dst}", flush=True)
+            else:
+                print(f"❌ rclone sync {rel} PERDU après 3 essais", flush=True)
+                if rel.endswith(".pt"):
+                    self.failed = True
+
+    def wait(self, timeout=600):
+        self._q.join()
+
+    def prune(self, keep: int):
+        """Garde les `keep` plus grands step_*.pt distants, supprime le reste."""
+        try:
+            r = _rclone("lsf", f"{self.remote}/checkpoints/", "--files-only", check=False)
+            names = sorted((n for n in r.stdout.split() if n.startswith("step_") and n.endswith(".pt")),
+                           key=_step_of)
+            for old in names[:-keep] if keep > 0 else []:
+                _rclone("deletefile", f"{self.remote}/checkpoints/{old}", check=False)
+        except Exception as e:
+            print(f"⚠️  prune remote échoué ({e})", flush=True)
+
+
+def latest_rclone_checkpoint(remote: str, dest_dir: Path):
+    """Télécharge le plus grand step_*.pt du remote rclone. Retourne le path local."""
+    try:
+        r = _rclone("lsf", f"{remote}/checkpoints/", "--files-only", check=False)
+        names = [n for n in r.stdout.split() if n.startswith("step_") and n.endswith(".pt")]
+        if not names:
+            return None
+        best = max(names, key=_step_of)
+        dest = dest_dir / best
+        _rclone("copyto", f"{remote}/checkpoints/{best}", str(dest), check=True)
+        print(f"⬇️  checkpoint {remote} {best} (step {_step_of(Path(best))}) rapatrié", flush=True)
+        return dest
+    except Exception as e:
+        print(f"⚠️  lookup rclone échoué ({type(e).__name__}: {e})", flush=True)
+        return None
+
+
 def latest_hf_checkpoint(repo_id: str, dest_dir: Path):
     """Télécharge le plus gros step_*.pt du repo HF dans dest_dir. Retourne le path local."""
     try:
@@ -287,6 +385,13 @@ def main():
             print(f"sync HF → {args.hf_repo}", flush=True)
         except Exception as e:
             print(f"⚠️  HF sync indisponible ({e}) — Drive seul", flush=True)
+    if args.sync_remote:
+        try:
+            _rclone("listremotes", check=True)
+            syncers.append(RcloneSyncer(args.sync_remote))
+            print(f"sync rclone → {args.sync_remote} (compte propriétaire)", flush=True)
+        except Exception as e:
+            print(f"⚠️  rclone indisponible ({e}) — ignoré", flush=True)
     syncer = syncers[0] if syncers else None  # compat affichage
 
     if sync_dir:
@@ -393,6 +498,10 @@ def main():
             hf_ckpt = latest_hf_checkpoint(args.hf_repo, work_dir)
             if hf_ckpt and (ckpt is None or _step_of(hf_ckpt) > _step_of(ckpt)):
                 ckpt = hf_ckpt
+        if args.sync_remote:
+            rc_ckpt = latest_rclone_checkpoint(args.sync_remote, local_ckpt)
+            if rc_ckpt and (ckpt is None or _step_of(rc_ckpt) > _step_of(ckpt)):
+                ckpt = rc_ckpt
         if ckpt is not None:
             if ckpt.parent == sync_ckpt:
                 # checkpoint distant → rapatriement local avant chargement
@@ -479,6 +588,9 @@ def main():
                         except Exception:
                             pass
                     for s in syncers:
+                        if isinstance(s, RcloneSyncer):
+                            s.prune(args.keep_checkpoints)
+                    for s in syncers:
                         s.submit(local_ckpt / f"step_{step}.pt",
                                  f"checkpoints/step_{step}.pt")
                         s.submit(work_dir / "vocab.json", "vocab.json")
@@ -549,6 +661,8 @@ def main():
                     s.submit(f, f"model/{f.name}")
         for s in syncers:
             s.wait(timeout=1800)
+            if isinstance(s, RcloneSyncer):
+                s.prune(args.keep_checkpoints)
         if sync_ckpt:
             try:
                 prune_checkpoints(sync_ckpt, args.keep_checkpoints)
