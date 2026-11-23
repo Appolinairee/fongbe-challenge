@@ -262,6 +262,9 @@ def main():
             print(f"↻ reprise depuis {ckpt.name} (step {step})", flush=True)
 
     # ---------- Boucle d'entraînement ----------
+    print(f"=== TRAINING {step} → {args.max_steps} steps "
+          f"(checkpoint /{args.checkpoint_every}, "
+          f"sync Drive: {'oui' if syncer else 'non'}) ===", flush=True)
     model.train()
     micro, running = 0, []
     while step < args.max_steps:
@@ -287,8 +290,11 @@ def main():
             scheduler.step()
             step += 1
             if step % 100 == 0:
+                elapsed = time.time() - start_time
+                sec_per_step = elapsed / max(step, 1)
+                eta_min = (args.max_steps - step) * sec_per_step / 60
                 print(f"step {step:5d}/{args.max_steps}  loss {np.mean(running):.3f}  "
-                      f"{(time.time()-start_time)/60:5.1f} min", flush=True)
+                      f"{elapsed/60:5.1f} min écoulées  ETA {eta_min:5.1f} min", flush=True)
                 running = []
             if step % args.checkpoint_every == 0:
                 try:
@@ -298,18 +304,25 @@ def main():
                                      "torch": torch.get_rng_state(),
                                      "cuda": torch.cuda.get_rng_state() if device == "cuda" else None})
                     prune_checkpoints(local_ckpt, args.keep_checkpoints)
+                    if sync_ckpt:
+                        try:
+                            prune_checkpoints(sync_ckpt, args.keep_checkpoints)
+                        except Exception:
+                            pass
                     if syncer:
                         syncer.submit(local_ckpt / f"step_{step}.pt",
                                       f"checkpoints/step_{step}.pt")
                         syncer.submit(work_dir / "vocab.json", "vocab.json")
-                    print(f"💾 checkpoint step_{step} (local" +
-                          (" + sync Drive" if syncer else "") + ")", flush=True)
+                    print(f"💾 checkpoint step_{step} écrit en local"
+                          + (" — sync Drive en cours" if syncer else ""), flush=True)
                 except Exception as e:
                     print(f"⚠️ checkpoint step_{step} échoué ({e}) — training continue", flush=True)
             if step >= args.max_steps:
                 break
 
     # ---------- Évaluation ----------
+    print(f"=== EVALUATION sur {len(valid_df)} utterances tenues ===", flush=True)
+
     @torch.no_grad()
     def transcribe(df, batch_size=8):
         model.eval()
