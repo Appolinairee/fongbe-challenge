@@ -106,24 +106,50 @@ def save_checkpoint(path: Path, step, model, optimizer, scheduler, scaler, rng_s
     os.replace(tmp, path)
 
 
-def prune_checkpoints(ckpt_dir: Path, keep: int):
+def prune_checkpoints(ckpt_dir: Path, keep: int, protect=None):
     cands = sorted(ckpt_dir.glob("step_*.pt"), key=_step_of)
     for old in cands[:-keep] if keep > 0 else []:
+        if protect and protect(old):
+            continue  # encore en file de sync — ne pas supprimer la source
         old.unlink(missing_ok=True)
+    # Nettoie les .tmp orphelins de copies interrompues (>60 min)
+    cutoff = time.time() - 3600
+    for tmp in ckpt_dir.glob("*.tmp"):
+        try:
+            if tmp.stat().st_mtime < cutoff:
+                tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class Syncer:
-    """Copie en arrière-plan des checkpoints/artefacts vers le dossier partagé."""
+    """Copie en arrière-plan des checkpoints/artefacts vers le dossier partagé.
+
+    File SÉQUENTIELLE : une seule copie à la fois — les checkpoints font ~7 GB
+    et les copies parallèles saturaient le mount FUSE (d'où les .tmp à 0 octet).
+    """
 
     def __init__(self, sync_dir: Path):
+        import queue
         self.sync_dir = sync_dir
-        self._threads = []
+        self._q = queue.Queue()
+        self._pending = set()  # src encore en file — ne pas élager localement
         self.failed = False  # True si un artefact critique (.pt) n'a pas pu être synchronisé
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
 
     def submit(self, src: Path, rel: str):
-        dst = self.sync_dir / rel
+        self._pending.add(str(src))
+        self._q.put((src, rel))
 
-        def work():
+    def is_pending(self, path: Path) -> bool:
+        return str(path) in self._pending
+
+    def _run(self):
+        while True:
+            src, rel = self._q.get()
+            self._pending.discard(str(src))
+            dst = self.sync_dir / rel
             ok = False
             for attempt in range(3):
                 try:
@@ -151,13 +177,8 @@ class Syncer:
                 if rel.endswith(".pt"):
                     self.failed = True
 
-        t = threading.Thread(target=work, daemon=True)
-        self._threads.append(t)
-        t.start()
-
     def wait(self, timeout=600):
-        for t in self._threads:
-            t.join(timeout=max(1, timeout // max(1, len(self._threads))))
+        self._q.join()
 
 
 def main():
@@ -349,7 +370,8 @@ def main():
                                     {"python": random.getstate(), "numpy": np.random.get_state(),
                                      "torch": torch.get_rng_state(),
                                      "cuda": torch.cuda.get_rng_state() if device == "cuda" else None})
-                    prune_checkpoints(local_ckpt, args.keep_checkpoints)
+                    prune_checkpoints(local_ckpt, args.keep_checkpoints,
+                                      protect=syncer.is_pending if syncer else None)
                     if sync_ckpt:
                         try:
                             prune_checkpoints(sync_ckpt, args.keep_checkpoints)
@@ -359,8 +381,9 @@ def main():
                         syncer.submit(local_ckpt / f"step_{step}.pt",
                                       f"checkpoints/step_{step}.pt")
                         syncer.submit(work_dir / "vocab.json", "vocab.json")
+                    qsize = syncer._q.qsize() if syncer else 0
                     print(f"💾 checkpoint step_{step} écrit en local"
-                          + (" — sync Drive en cours" if syncer else ""), flush=True)
+                          + (f" — sync Drive en cours (file: {qsize})" if syncer else ""), flush=True)
                 except Exception as e:
                     print(f"⚠️ checkpoint step_{step} échoué ({e}) — training continue", flush=True)
             if step >= args.max_steps:
