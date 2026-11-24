@@ -556,10 +556,17 @@ def main():
                             collate_fn=collate, num_workers=2)
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.autocast(device_type="cuda", dtype=torch.float16,
-                                enabled=device == "cuda"):
-                loss = model(**batch).loss / args.grad_accum
-            scaler.scale(loss).backward()
+            try:
+                with torch.autocast(device_type="cuda", dtype=torch.float16,
+                                    enabled=device == "cuda"):
+                    loss = model(**batch).loss / args.grad_accum
+                scaler.scale(loss).backward()
+            except torch.cuda.OutOfMemoryError:
+                print(f"⚠️  OOM — batch ignoré (step ~{step}), cache vidé", flush=True)
+                del batch
+                torch.cuda.empty_cache()
+                optimizer.zero_grad(set_to_none=True)
+                continue
             running.append(loss.item() * args.grad_accum)
             micro += 1
             if micro % args.grad_accum:
