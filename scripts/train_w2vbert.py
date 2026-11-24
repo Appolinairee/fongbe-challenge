@@ -582,12 +582,15 @@ def main():
                 print("⛔ sync en échec sur TOUTES les destinations — arrêt propre "
                       "(checkpoints locaux conservés, relançable)", flush=True)
                 break
-            if step % 100 == 0:
+            if step % 20 == 0:
                 elapsed = time.time() - start_time
                 sec_per_step = elapsed / max(step, 1)
                 eta_min = (args.max_steps - step) * sec_per_step / 60
+                gpu = (torch.cuda.memory_allocated() / 1e9
+                       if device == "cuda" else 0.0)
                 print(f"step {step:5d}/{args.max_steps}  loss {np.mean(running):.3f}  "
-                      f"{elapsed/60:5.1f} min écoulées  ETA {eta_min:5.1f} min", flush=True)
+                      f"GPU {gpu:4.1f} Go  {elapsed/60:5.1f} min  ETA {eta_min:5.1f} min",
+                      flush=True)
                 running = []
             if step % args.checkpoint_every == 0:
                 try:
