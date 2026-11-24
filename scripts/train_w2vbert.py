@@ -403,8 +403,13 @@ def main():
                   f"(contenu: {markers}). Checkpoints possiblement perdus — "
                   f"vérifier que le compte Colab a bien le raccourci Drive.", flush=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device} {torch.cuda.get_device_name(0) if device == 'cuda' else ''}", flush=True)
+    if not torch.cuda.is_available():
+        sys.exit("⛔ CUDA indisponible — ce runtime n'a PAS de GPU "
+                 "(quota épuisé ?). Change de runtime (Runtime → Change runtime "
+                 "type → GPU) ou de compte, puis relance. Entraîner sur CPU "
+                 "tuerait la VM (exit -9).")
+    device = "cuda"
+    print(f"device: {device} {torch.cuda.get_device_name(0)}", flush=True)
 
     sys.path.insert(0, str(data_dir))
     from normalize import tonal_target  # noqa: E402  (script fourni par l'orga)
