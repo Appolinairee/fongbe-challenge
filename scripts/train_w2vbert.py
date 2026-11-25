@@ -520,7 +520,7 @@ def main():
                 local_ckpt.mkdir(parents=True, exist_ok=True)
                 atomic_copy(ckpt, local_ckpt / ckpt.name)
                 ckpt = local_ckpt / ckpt.name
-            state = torch.load(ckpt, map_location=device, weights_only=False)
+            state = torch.load(ckpt, map_location="cpu", weights_only=False)
             model.load_state_dict(state["model"])
             try:
                 optimizer.load_state_dict(state["optimizer"])
@@ -542,6 +542,9 @@ def main():
             except Exception as e:
                 print(f"⚠️ état RNG non restauré ({e}) — reprise continue", flush=True)
             step = state["step"]
+            del state
+            if device == "cuda":
+                torch.cuda.empty_cache()
             print(f"↻ reprise depuis {ckpt.name} (step {step})", flush=True)
 
     # ---------- Boucle d'entraînement ----------
