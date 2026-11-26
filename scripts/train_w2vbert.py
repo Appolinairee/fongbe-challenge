@@ -71,6 +71,10 @@ def parse_args():
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--include-religious", action="store_true",
                    help="Ajoute Train_religious.csv au train (pas de split val : tout en train)")
+    p.add_argument("--include-uncertain", action="store_true",
+                   help="Ajoute TOUTES les lignes de Train_uncertain.csv au train")
+    p.add_argument("--uncertain-weight", type=float, default=1.0,
+                   help="Poids d'échantillonnage des lignes uncertain (défaut 1.0)")
     return p.parse_args()
 
 
@@ -426,6 +430,16 @@ def main():
             reliable = pd.concat([reliable, religious], ignore_index=True)
             print(f"+ Train_religious: {len(religious):,} utts "
                   f"({religious.duration.sum()/3600:.1f} h)", flush=True)
+    if args.include_uncertain:
+        unc_path = data_dir / "Train_uncertain.csv"
+        if unc_path.exists():
+            unc = pd.read_csv(unc_path)
+            unc["recommended_validation"] = 0
+            unc["_w"] = args.uncertain_weight
+            reliable = pd.concat([reliable.assign(_w=1.0), unc], ignore_index=True)
+            print(f"+ Train_uncertain: {len(unc):,} utts "
+                  f"({unc.duration.sum()/3600:.1f} h, poids {args.uncertain_weight})",
+                  flush=True)
     reliable["target"] = reliable.transcription.map(tonal_target).str.strip()
     reliable["wav"] = reliable.audio_path.map(lambda p: str(data_dir / p))
     available = reliable[reliable.wav.map(lambda p: Path(p).exists()) & (reliable.target != "")]
@@ -500,7 +514,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"{n_params:.0f} M parameters", flush=True)
 
-    train_set = SpeechSet(train_df)
+    train_set = None  # SpeechSet reconstruit par epoch (échantillonnage pondéré)
     try:
         from bitsandbytes.optim import AdamW8bit
         optimizer = AdamW8bit(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
@@ -568,8 +582,12 @@ def main():
     total_q = lambda: sum(s._q.qsize() for s in syncers)
 
     while step < args.max_steps and not all_failed():
-        loader = DataLoader(train_set,
-                            batch_sampler=length_batches(train_df.duration.values,
+        epoch_df = train_df
+        if "_w" in train_df.columns:
+            epoch_df = train_df.sample(frac=1.0, replace=True,
+                                       weights="_w", random_state=step)
+        loader = DataLoader(SpeechSet(epoch_df),
+                            batch_sampler=length_batches(epoch_df.duration.values,
                                                          args.batch_size, True),
                             collate_fn=collate, num_workers=2)
         for batch in loader:
