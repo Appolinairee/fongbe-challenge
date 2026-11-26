@@ -75,6 +75,8 @@ def parse_args():
                    help="Ajoute TOUTES les lignes de Train_uncertain.csv au train")
     p.add_argument("--uncertain-weight", type=float, default=1.0,
                    help="Poids d'échantillonnage des lignes uncertain (défaut 1.0)")
+    p.add_argument("--mask-time-prob", type=float, default=0.0)
+    p.add_argument("--mask-feature-prob", type=float, default=0.0)
     return p.parse_args()
 
 
@@ -507,7 +509,9 @@ def main():
     # ---------- Modèle ----------
     model = Wav2Vec2BertForCTC.from_pretrained(
         args.base_model, attention_dropout=0.0, hidden_dropout=0.0, feat_proj_dropout=0.0,
-        mask_time_prob=0.0, layerdrop=0.0, ctc_loss_reduction="mean", ctc_zero_infinity=True,
+        mask_time_prob=args.mask_time_prob, mask_feature_prob=args.mask_feature_prob,
+        apply_spec_augment=(args.mask_time_prob > 0 or args.mask_feature_prob > 0),
+        layerdrop=0.0, ctc_loss_reduction="mean", ctc_zero_infinity=True,
         add_adapter=True, pad_token_id=tokenizer.pad_token_id,
         vocab_size=len(tokenizer)).to(device)
     model.gradient_checkpointing_enable()
