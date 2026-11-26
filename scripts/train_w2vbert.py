@@ -69,6 +69,8 @@ def parse_args():
     p.add_argument("--keep-checkpoints", type=int, default=3)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--include-religious", action="store_true",
+                   help="Ajoute Train_religious.csv au train (pas de split val : tout en train)")
     return p.parse_args()
 
 
@@ -416,6 +418,14 @@ def main():
 
     # ---------- Données ----------
     reliable = pd.read_csv(data_dir / "Train_reliable.csv")
+    if args.include_religious:
+        rel_path = data_dir / "Train_religious.csv"
+        if rel_path.exists():
+            religious = pd.read_csv(rel_path)
+            religious["recommended_validation"] = 0
+            reliable = pd.concat([reliable, religious], ignore_index=True)
+            print(f"+ Train_religious: {len(religious):,} utts "
+                  f"({religious.duration.sum()/3600:.1f} h)", flush=True)
     reliable["target"] = reliable.transcription.map(tonal_target).str.strip()
     reliable["wav"] = reliable.audio_path.map(lambda p: str(data_dir / p))
     available = reliable[reliable.wav.map(lambda p: Path(p).exists()) & (reliable.target != "")]
