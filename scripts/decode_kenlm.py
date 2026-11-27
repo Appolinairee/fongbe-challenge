@@ -23,6 +23,7 @@ def main():
     ap.add_argument('--alpha', type=float, default=0.5)
     ap.add_argument('--beta', type=float, default=1.5)
     ap.add_argument('--beam-width', type=int, default=100)
+    ap.add_argument('--shard', default='0/1', help='i/n : traite le shard i parmi n')
     args = ap.parse_args()
 
     logits_dir = Path(args.logits_dir)
@@ -32,7 +33,9 @@ def main():
     dec = build_ctcdecoder(labels, kenlm_model_path=str(LM / 'lm.bin'),
                            unigrams=unigrams, alpha=args.alpha, beta=args.beta)
     files = sorted(logits_dir.glob('*.npy'))
-    print(f'{len(files)} logits à décoder', flush=True)
+    si, sn = (int(x) for x in args.shard.split('/'))
+    files = [f for i, f in enumerate(files) if i % sn == si]
+    print(f'{len(files)} logits à décoder (shard {si}/{sn})', flush=True)
     out = {}
     t0 = time.time()
     for i, f in enumerate(files):
